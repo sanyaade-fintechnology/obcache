@@ -7,6 +7,7 @@ import logging
 import json
 import argparse
 from zmapi.codes import error
+from zmapi.zmq import SockRecvPublisher
 import uuid
 from sortedcontainers import SortedDict
 from time import gmtime
@@ -287,6 +288,7 @@ def init_zmq_sockets(args):
     g.sock_deal = g.ctx.socket(zmq.DEALER)
     g.sock_deal.setsockopt_string(zmq.IDENTITY, MODULE_NAME)
     g.sock_deal.connect(args.ctl_addr_up)
+    g.sock_deal_pub = SockRecvPublisher(g.ctx, g.sock_deal)
     g.sock_ctl = g.ctx.socket(zmq.ROUTER)
     g.sock_ctl.bind(args.ctl_addr_down)
     g.sock_sub = g.ctx.socket(zmq.SUB)
@@ -385,7 +387,7 @@ async def get_ticker_info(ticker_id: str):
     msg = " " + json.dumps(data)
     msg = msg.encode()
     await g.sock_deal.send_multipart([b"", msg])
-    msg_parts = await poll_for_msg_id(msg_id)
+    msg_parts = await g.sock_deal_pub.poll_for_msg_id(msg_id)
     msg = json.loads(msg_parts[1].decode())
     if msg["result"] != "ok":
         return None
@@ -427,36 +429,6 @@ async def check_capabilities():
 
 ###############################################################################
 
-async def dealer_result_publisher():
-    L.info("dealer_result_publisher running ...")
-    g.sock_deal_pub = g.ctx.socket(zmq.PUB)
-    g.sock_deal_pub.bind("inproc://deal_pub")
-    while True:
-        msg_parts = await g.sock_deal.recv_multipart()
-        msg = msg_parts[-1]
-        if len(msg) == 0:
-            msg_id = b"PING"
-        else:
-            msg = json.loads(msg.decode())
-            msg_id = msg["msg_id"].encode()
-        g.sock_deal_pub.send_multipart([msg_id] + msg_parts)
-
-async def poll_for_msg_id(msg_id=None, timeout=None):
-    sock = g.ctx.socket(zmq.SUB)
-    sock.connect("inproc://deal_pub")
-    sock.subscribe(msg_id.encode())
-    poller = zmq.asyncio.Poller()
-    poller.register(sock, zmq.POLLIN)
-    res = await poller.poll(timeout)
-    if not res:
-        return
-    msg_parts = await sock.recv_multipart()
-    sock.close()
-    # skip the topic
-    return msg_parts[1:]
-
-###############################################################################
-
 async def send_error(ident, msg_id, ecode, msg=None):
     msg = error.gen_error(ecode, msg)
     msg["msg_id"] = msg_id
@@ -475,14 +447,11 @@ async def run_ctl_interceptor():
             continue
         if len(msg) == 0:
             # handle ping message
-            await fwd_message_no_change(msg_parts)
+            await g.sock_deal.send_multipart(msg_parts)
+            res = await g.sock_deal_pub.poll_for_pong()
+            await g.sock_ctl.send_multipart(res)
             continue
         create_task(handle_ctl_msg_1(ident, msg))
-
-async def fwd_message_no_change(msg_id, msg_parts):
-    await g.sock_deal.send_multipart(msg_parts)
-    res = await poll_for_msg_id(msg_id)
-    await g.sock_ctl.send_multipart(res)
 
 async def handle_ctl_msg_1(ident, msg_raw):
     msg = json.loads(msg_raw.decode())
@@ -499,6 +468,11 @@ async def handle_ctl_msg_1(ident, msg_raw):
     else:
         await fwd_message_no_change(msg_id, ident + [b"", msg_raw])
     L.debug("< " + debug_msg)
+
+async def fwd_message_no_change(msg_id, msg_parts):
+    await g.sock_deal.send_multipart(msg_parts)
+    res = await g.sock_deal_pub.poll_for_msg_id(msg_id)
+    await g.sock_ctl.send_multipart(res)
 
 async def handle_get_snapshot(ident, msg):
     content = msg["content"]
@@ -519,7 +493,7 @@ async def handle_get_snapshot(ident, msg):
     msg_bytes = " " + json.dumps(msg)
     msg_bytes = msg_bytes.encode()
     await g.sock_deal.send_multipart(ident + [b"", msg_bytes])
-    msg_parts = await poll_for_msg_id(msg["msg_id"])
+    msg_parts = await g.sock_deal_pub.poll_for_msg_id(msg["msg_id"])
     res = json.loads(msg_parts[-1].decode())
     if res["result"] != "ok":
         await g.sock_ctl.send_multipart(msg_parts)
@@ -579,7 +553,7 @@ def main():
     tasks = [
         create_task(run_md_converter()),
         create_task(run_ctl_interceptor()),
-        create_task(dealer_result_publisher()),
+        create_task(g.sock_deal_pub.run()),
     ]
     g.loop.run_until_complete(asyncio.gather(*tasks))
 
