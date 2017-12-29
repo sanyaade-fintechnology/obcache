@@ -12,6 +12,7 @@ import uuid
 from sortedcontainers import SortedDict
 from time import gmtime
 from pprint import pprint, pformat
+from datetime import datetime
 
 ################################## CONSTANTS ##################################
 
@@ -27,6 +28,10 @@ g = GlobalState()
 g.loop = asyncio.get_event_loop()
 g.ctx = zmq.asyncio.Context()
 g.cache = {}
+g.startup_time = datetime.utcnow()
+g.pub_bytes_in = 0
+g.pub_bytes_out = 0
+g.status = "ok"
 
 ################################### HELPERS ###################################
 
@@ -309,12 +314,15 @@ async def run_md_converter():
         create_task(handle_md_msg(ticker_id, msg_parts))
 
 async def handle_md_msg(ticker_id: bytes, msg_parts):
-        try:
-            msg = await convert_md_msg(ticker_id, msg_parts[1])
-        except Exception as err:
-            L.exception("exception when converting message:", err)
-        else:
-            await g.sock_pub.send_multipart([msg_parts[0], msg])
+    g.pub_bytes_in += sum([len(x) for x in msg_parts])
+    topic = msg_parts[0]
+    try:
+        msg_bytes = await convert_md_msg(ticker_id, msg_parts[1])
+    except Exception as err:
+        L.exception("exception when converting message:", err)
+    else:
+        g.pub_bytes_out += len(topic) + len(msg_bytes)
+        await g.sock_pub.send_multipart([topic, msg_bytes])
         
 async def convert_md_msg(ticker_id: bytes, msg):
     if g.cache.get(ticker_id) == 0:  # ignored ticker_id
@@ -459,14 +467,16 @@ async def handle_ctl_msg_1(ident, msg_raw):
     cmd = msg["command"]
     debug_msg = "ident={}, command={}".format(ident_to_str(ident), cmd)
     L.debug("> " + debug_msg)
-    if cmd == "get_snapshot":
-        try:
+    try:
+        if cmd == "get_snapshot":
             await handle_get_snapshot(ident, msg)
-        except Exception as e:
-            L.exception("exception on handle_get_snapshot:")
-            await send_error(ident, msg_id, error.GENERIC, str(e))
-    else:
-        await fwd_message_no_change(msg_id, ident + [b"", msg_raw])
+        elif cmd == "get_status":
+            await get_status(ident, msg)
+        else:
+            await fwd_message_no_change(msg_id, ident + [b"", msg_raw])
+    except Exception as e:
+        L.exception("exception on msg_id: {}".format(msg_id))
+        await send_error(ident, msg_id, error.GENERIC, str(e))
     L.debug("< " + debug_msg)
 
 async def fwd_message_no_change(msg_id, msg_parts):
@@ -527,19 +537,24 @@ def construct_ob_levels_from_cache(cache, num_levels):
     }
     return res
 
-def parse_ctl_message(msg):
-    codec = int(msg[0])
-    if codec != 32:
-        raise CodecException()
-    try:
-        msg = msg.decode()
-        msg = json.loads(msg)
-    except Exception as e:
-        raise DecodingException(e)
-    return msg
-
-        
-
+async def get_status(ident, msg):
+    msg_bytes = (" " + json.dumps(msg)).encode()
+    await g.sock_deal.send_multipart(ident + [b"", msg_bytes])
+    msg_parts = await g.sock_deal_pub.poll_for_msg_id(msg["msg_id"])
+    msg = json.loads(msg_parts[-1].decode())
+    content = msg["content"]
+    status = {
+        "name": MODULE_NAME,
+        "num_cached_order_books": len([x for x in g.cache if x != 0]),
+        "status": g.status,
+        "uptime": (datetime.utcnow() - g.startup_time).total_seconds(),
+        "pub_bytes_in": g.pub_bytes_in,
+        "pub_bytes_out": g.pub_bytes_out,
+    }
+    content = [status] + content
+    msg["content"] = content
+    msg_bytes = (" " + json.dumps(msg)).encode()
+    await g.sock_ctl.send_multipart(ident + [b"", msg_bytes])
 
 def main():
     global L
