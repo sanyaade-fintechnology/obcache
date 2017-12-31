@@ -35,13 +35,6 @@ g.status = "ok"
 
 ################################### HELPERS ###################################
 
-# # mutates itr
-# def peek_first(itr):
-#     try:
-#         return next(itr)
-#     except StopIteration:
-#         return None
-
 def split_message(msg_parts):
     separator_idx = None
     for i, part in enumerate(msg_parts):
@@ -253,6 +246,249 @@ class OrderBook:
                 return price
         return -sys.maxsize if is_bid else sys.maxsize
 
+################################ MD CONVERTER #################################
+
+async def get_ticker_info(ticker_id: str):
+    msg_id = str(uuid.uuid4())
+    data = {
+        "command": "get_ticker_info",
+        "msg_id": msg_id,
+        "content": {
+            "ticker": {"ticker_id": ticker_id}
+        }
+    }
+    msg = " " + json.dumps(data)
+    msg = msg.encode()
+    await g.sock_deal.send_multipart([b"", msg])
+    msg_parts = await g.sock_deal_pub.poll_for_msg_id(msg_id)
+    msg = json.loads(msg_parts[1].decode())
+    if msg["result"] != "ok":
+        return None
+    return msg["content"]
+
+def get_converters(msg):
+    if msg["float_price"]:
+        ts = msg["price_tick_size"]
+        if isinstance(ts, list):
+            # use the smallest tick size
+            ts = tick_size[0][1]
+        num_decimals = len(str(ts).split(".")[1])
+        ts = 1.0 * 10 ** -num_decimals
+        def f2i_converter(x):
+            return round(x / ts)
+        def i2f_converter(x):
+            return round(x * ts, num_decimals)
+    else:
+        # If prices are in int format no conversion needed =>
+        # return identity functions.
+        def f2i_converter(x):
+            return x
+        def i2f_converter(x):
+            return x
+    return f2i_converter, i2f_converter
+
+# mutates data
+async def convert_data(ticker_id: bytes, data):
+    cache = g.cache.get(ticker_id)
+    if not cache:
+        g.cache[ticker_id] = cache = {}
+        ticker_id_str = ticker_id.decode()
+        L.info("fetching ticker info for {} ...".format(ticker_id_str))
+        # if R is None:
+        #     msg = "variable tick_size is not implemented yet, ignored {}"
+        #     msg = msg.format(ticker_id)
+        #     L.warning(msg)
+        #     topic = "{}\x03".format(MODULE_NAME)
+        #     msg = "variable ticksize is not implemented, ignored: 
+        #     g.sock_pub.send_multipart([topic.encode(), msg.encode()])
+        #     g.cache[ticker_id] = 0
+        #     return data
+        ticker_info = await get_ticker_info(ticker_id_str)
+        if not ticker_info:
+            L.warning("failed to fetch ticker_info for {}"
+                      .format(ticker_id_str))
+            g.cache[ticker_id] = 0
+            return data
+        f2i_converter, i2f_converter = get_converters(ticker_info)
+        L.info("price converter constructed for: {}".format(ticker_id_str))
+        cache["order_book"] = OrderBook(ticker_id,
+                                        f2i_converter,
+                                        i2f_converter,
+                                        ticker_info["float_volume"])
+    # L.debug(data["bids"][0])
+    # print("INPUT")
+    # pprint(data)
+    ob = cache["order_book"]
+    updates = ob.update(data)
+    # print("OUTPUT")
+    # pprint(updates)
+    if updates["bids"]:
+        data["bids"] = updates["bids"]
+    if updates["implied_bids"]:
+        data["implied_bids"] = updates["implied_bids"]
+    if updates["asks"]:
+        data["asks"] = updates["asks"]
+    if updates["implied_asks"]:
+        data["implied_asks"] = updates["implied_asks"]
+
+async def convert_md_msg(ticker_id: bytes, msg):
+    if g.cache.get(ticker_id) == 0:  # ignored ticker_id
+        return msg
+    if not msg:
+        # unsubscribed, delete cached data
+        try:
+            del g.cache[ticker_id]
+        except KeyError:
+            pass
+        return msg
+    data = json.loads(msg.decode())
+    await convert_data(ticker_id, data)
+    msg = (" " + json.dumps(data)).encode()
+    return msg
+
+async def handle_md_msg(ticker_id: bytes, msg_parts):
+    g.pub_bytes_in += sum([len(x) for x in msg_parts])
+    topic = msg_parts[0]
+    try:
+        msg_bytes = await convert_md_msg(ticker_id, msg_parts[1])
+    except Exception as err:
+        L.exception("exception when converting message:", err)
+    else:
+        g.pub_bytes_out += len(topic) + len(msg_bytes)
+        await g.sock_pub.send_multipart([topic, msg_bytes])
+
+async def run_md_converter():
+    L.info("running md converter coroutine...")
+    while True:
+        msg_parts = await g.sock_sub.recv_multipart()
+        msg_type = msg_parts[0][-1]
+        if msg_type != 1:
+            await g.sock_pub.send_multipart(msg_parts)
+            continue
+        ticker_id = msg_parts[0][:-1]
+        create_task(handle_md_msg(ticker_id, msg_parts))
+
+############################### CTL INTERCEPTOR ###############################
+
+async def send_error(ident, msg_id, ecode, msg=None):
+    msg = error.gen_error(ecode, msg)
+    msg["msg_id"] = msg_id
+    msg = " " + json.dumps(msg)
+    msg = msg.encode()
+    await g.sock_ctl.send_multipart(ident + [b"", msg])
+
+async def fwd_message_no_change(msg_id, msg_parts):
+    await g.sock_deal.send_multipart(msg_parts)
+    res = await g.sock_deal_pub.poll_for_msg_id(msg_id)
+    await g.sock_ctl.send_multipart(res)
+
+def construct_ob_levels_from_cache(cache, num_levels):
+    ob = cache["order_book"]
+    def handle_book(book):
+        res = []
+        for i, lvl in enumerate(book.items()):
+            if i == num_levels:
+                break
+            price_i, size = lvl
+            price_f = ob.i2f_conv(price_i)
+            res.append([price_f, size])
+        return res
+    bids = handle_book(ob._bids)
+    implied_bids = handle_book(ob._implied_bids)
+    asks = handle_book(ob._asks)
+    implied_asks = handle_book(ob._implied_asks)
+    res = {
+        "asks": asks,
+        "bids": bids,
+        "implied_asks": implied_asks,
+        "implied_bids": implied_bids,
+    }
+    return res
+
+async def handle_get_snapshot(ident, msg):
+    content = msg["content"]
+    ticker_id = content["ticker_id"]
+    ob = None
+    ob_levels = content.get("order_book_levels", 0)
+    if ob_levels > 0 and ticker_id:
+        cache = g.cache.get(ticker_id.encode())
+        if cache and "order_book" in cache and cache["order_book"].initialized:
+            ob = construct_ob_levels_from_cache(cache, ob_levels)
+    if ob:
+        L.info("contructed order book from cache for ticker_id: {}"
+               .format(ticker_id))
+        content["order_book_levels"] = 0
+    else:
+        L.info("retrieving order book from upstream ctl for ticker_id: {}..."
+               .format(ticker_id))
+    msg_bytes = " " + json.dumps(msg)
+    msg_bytes = msg_bytes.encode()
+    await g.sock_deal.send_multipart(ident + [b"", msg_bytes])
+    msg_parts = await g.sock_deal_pub.poll_for_msg_id(msg["msg_id"])
+    res = json.loads(msg_parts[-1].decode())
+    if res["result"] != "ok":
+        await g.sock_ctl.send_multipart(msg_parts)
+        return
+    if ob_levels > 0 and ob is not None:
+        res["content"]["order_book"] = ob
+    msg_bytes = " " + json.dumps(res)
+    msg_bytes = msg_bytes.encode()
+    await g.sock_ctl.send_multipart(ident + [b"", msg_bytes])
+
+async def get_status(ident, msg):
+    msg_bytes = (" " + json.dumps(msg)).encode()
+    await g.sock_deal.send_multipart(ident + [b"", msg_bytes])
+    msg_parts = await g.sock_deal_pub.poll_for_msg_id(msg["msg_id"])
+    msg = json.loads(msg_parts[-1].decode())
+    content = msg["content"]
+    status = {
+        "name": MODULE_NAME,
+        "num_cached_order_books": len([x for x in g.cache if x != 0]),
+        "status": g.status,
+        "uptime": (datetime.utcnow() - g.startup_time).total_seconds(),
+        "pub_bytes_in": g.pub_bytes_in,
+        "pub_bytes_out": g.pub_bytes_out,
+    }
+    content = [status] + content
+    msg["content"] = content
+    msg_bytes = (" " + json.dumps(msg)).encode()
+    await g.sock_ctl.send_multipart(ident + [b"", msg_bytes])
+
+async def handle_ctl_msg_1(ident, msg_raw):
+    msg = json.loads(msg_raw.decode())
+    msg_id = msg["msg_id"]
+    cmd = msg["command"]
+    debug_msg = "ident={}, command={}".format(ident_to_str(ident), cmd)
+    L.debug("> " + debug_msg)
+    try:
+        if cmd == "get_snapshot":
+            await handle_get_snapshot(ident, msg)
+        elif cmd == "get_status":
+            await get_status(ident, msg)
+        else:
+            await fwd_message_no_change(msg_id, ident + [b"", msg_raw])
+    except Exception as e:
+        L.exception("exception on msg_id: {}".format(msg_id))
+        await send_error(ident, msg_id, error.GENERIC, str(e))
+    L.debug("< " + debug_msg)
+
+async def run_ctl_interceptor():
+    L.info("running ctl interceptor coroutine ...")
+    while True:
+        msg_parts = await g.sock_ctl.recv_multipart()
+        try:
+            ident, msg = split_message(msg_parts)
+        except ValueError as err:
+            L.error(str(err))
+            continue
+        if len(msg) == 0:
+            # handle ping message
+            await g.sock_deal.send_multipart(msg_parts)
+            res = await g.sock_deal_pub.poll_for_pong()
+            await g.sock_ctl.send_multipart(res)
+            continue
+        create_task(handle_ctl_msg_1(ident, msg))
+
 ###############################################################################
 
 def parse_args():
@@ -302,126 +538,6 @@ def init_zmq_sockets(args):
     g.sock_pub = g.ctx.socket(zmq.PUB)
     g.sock_pub.bind(args.pub_addr_down)
 
-async def run_md_converter():
-    L.info("running md converter coroutine...")
-    while True:
-        msg_parts = await g.sock_sub.recv_multipart()
-        msg_type = msg_parts[0][-1]
-        if msg_type != 1:
-            await g.sock_pub.send_multipart(msg_parts)
-            continue
-        ticker_id = msg_parts[0][:-1]
-        create_task(handle_md_msg(ticker_id, msg_parts))
-
-async def handle_md_msg(ticker_id: bytes, msg_parts):
-    g.pub_bytes_in += sum([len(x) for x in msg_parts])
-    topic = msg_parts[0]
-    try:
-        msg_bytes = await convert_md_msg(ticker_id, msg_parts[1])
-    except Exception as err:
-        L.exception("exception when converting message:", err)
-    else:
-        g.pub_bytes_out += len(topic) + len(msg_bytes)
-        await g.sock_pub.send_multipart([topic, msg_bytes])
-        
-async def convert_md_msg(ticker_id: bytes, msg):
-    if g.cache.get(ticker_id) == 0:  # ignored ticker_id
-        return msg
-    if not msg:
-        # unsubscribed, delete cached data
-        try:
-            del g.cache[ticker_id]
-        except KeyError:
-            pass
-        return msg
-    data = json.loads(msg.decode())
-    await convert_data(ticker_id, data)
-    msg = (" " + json.dumps(data)).encode()
-    return msg
-
-# mutates data
-async def convert_data(ticker_id: bytes, data):
-    cache = g.cache.get(ticker_id)
-    if not cache:
-        g.cache[ticker_id] = cache = {}
-        ticker_id_str = ticker_id.decode()
-        L.info("fetching ticker info for {} ...".format(ticker_id_str))
-        # if R is None:
-        #     msg = "variable tick_size is not implemented yet, ignored {}"
-        #     msg = msg.format(ticker_id)
-        #     L.warning(msg)
-        #     topic = "{}\x03".format(MODULE_NAME)
-        #     msg = "variable ticksize is not implemented, ignored: 
-        #     g.sock_pub.send_multipart([topic.encode(), msg.encode()])
-        #     g.cache[ticker_id] = 0
-        #     return data
-        ticker_info = await get_ticker_info(ticker_id_str)
-        if not ticker_info:
-            L.warning("failed to fetch ticker_info for {}"
-                      .format(ticker_id_str))
-            g.cache[ticker_id] = 0
-            return data
-        f2i_converter, i2f_converter = get_converters(ticker_info)
-        L.info("price converter constructed for: {}".format(ticker_id_str))
-        cache["order_book"] = OrderBook(ticker_id,
-                                        f2i_converter,
-                                        i2f_converter,
-                                        ticker_info["float_volume"])
-    # L.debug(data["bids"][0])
-    # print("INPUT")
-    # pprint(data)
-    ob = cache["order_book"]
-    updates = ob.update(data)
-    # print("OUTPUT")
-    # pprint(updates)
-    if updates["bids"]:
-        data["bids"] = updates["bids"]
-    if updates["implied_bids"]:
-        data["implied_bids"] = updates["implied_bids"]
-    if updates["asks"]:
-        data["asks"] = updates["asks"]
-    if updates["implied_asks"]:
-        data["implied_asks"] = updates["implied_asks"]
-
-async def get_ticker_info(ticker_id: str):
-    msg_id = str(uuid.uuid4())
-    data = {
-        "command": "get_ticker_info",
-        "msg_id": msg_id,
-        "content": {
-            "ticker": {"ticker_id": ticker_id}
-        }
-    }
-    msg = " " + json.dumps(data)
-    msg = msg.encode()
-    await g.sock_deal.send_multipart([b"", msg])
-    msg_parts = await g.sock_deal_pub.poll_for_msg_id(msg_id)
-    msg = json.loads(msg_parts[1].decode())
-    if msg["result"] != "ok":
-        return None
-    return msg["content"]
-
-def get_converters(msg):
-    if msg["float_price"]:
-        ts = msg["price_tick_size"]
-        if isinstance(ts, list):
-            # use the smallest tick size
-            ts = tick_size[0][1]
-        num_decimals = len(str(ts).split(".")[1])
-        ts = 1.0 * 10 ** -num_decimals
-        def f2i_converter(x):
-            return round(x / ts)
-        def i2f_converter(x):
-            return round(x * ts, num_decimals)
-    else:
-        # If prices are in int format no conversion needed =>
-        # return identity functions.
-        def f2i_converter(x):
-            return x
-        def i2f_converter(x):
-            return x
-    return f2i_converter, i2f_converter
-
 async def check_capabilities():
     # meant to be run only at the initialization phase
     data = { "command": "list_capabilities" }
@@ -435,127 +551,6 @@ async def check_capabilities():
         L.critical("MD does not support GET_TICKER_INFO_PRICE_TICK_SIZE cap")
         sys.exit(1)
 
-###############################################################################
-
-async def send_error(ident, msg_id, ecode, msg=None):
-    msg = error.gen_error(ecode, msg)
-    msg["msg_id"] = msg_id
-    msg = " " + json.dumps(msg)
-    msg = msg.encode()
-    await g.sock_ctl.send_multipart(ident + [b"", msg])
-
-async def run_ctl_interceptor():
-    L.info("running ctl interceptor coroutine...")
-    while True:
-        msg_parts = await g.sock_ctl.recv_multipart()
-        try:
-            ident, msg = split_message(msg_parts)
-        except ValueError as err:
-            L.error(str(err))
-            continue
-        if len(msg) == 0:
-            # handle ping message
-            await g.sock_deal.send_multipart(msg_parts)
-            res = await g.sock_deal_pub.poll_for_pong()
-            await g.sock_ctl.send_multipart(res)
-            continue
-        create_task(handle_ctl_msg_1(ident, msg))
-
-async def handle_ctl_msg_1(ident, msg_raw):
-    msg = json.loads(msg_raw.decode())
-    msg_id = msg["msg_id"]
-    cmd = msg["command"]
-    debug_msg = "ident={}, command={}".format(ident_to_str(ident), cmd)
-    L.debug("> " + debug_msg)
-    try:
-        if cmd == "get_snapshot":
-            await handle_get_snapshot(ident, msg)
-        elif cmd == "get_status":
-            await get_status(ident, msg)
-        else:
-            await fwd_message_no_change(msg_id, ident + [b"", msg_raw])
-    except Exception as e:
-        L.exception("exception on msg_id: {}".format(msg_id))
-        await send_error(ident, msg_id, error.GENERIC, str(e))
-    L.debug("< " + debug_msg)
-
-async def fwd_message_no_change(msg_id, msg_parts):
-    await g.sock_deal.send_multipart(msg_parts)
-    res = await g.sock_deal_pub.poll_for_msg_id(msg_id)
-    await g.sock_ctl.send_multipart(res)
-
-async def handle_get_snapshot(ident, msg):
-    content = msg["content"]
-    ticker_id = content["ticker_id"]
-    ob = None
-    ob_levels = content.get("order_book_levels", 0)
-    if ob_levels > 0 and ticker_id:
-        cache = g.cache.get(ticker_id.encode())
-        if cache and "order_book" in cache and cache["order_book"].initialized:
-            ob = construct_ob_levels_from_cache(cache, ob_levels)
-    if ob:
-        L.info("contructed order book from cache for ticker_id: {}"
-               .format(ticker_id))
-        content["order_book_levels"] = 0
-    else:
-        L.info("retrieving order book from upstream ctl for ticker_id: {}..."
-               .format(ticker_id))
-    msg_bytes = " " + json.dumps(msg)
-    msg_bytes = msg_bytes.encode()
-    await g.sock_deal.send_multipart(ident + [b"", msg_bytes])
-    msg_parts = await g.sock_deal_pub.poll_for_msg_id(msg["msg_id"])
-    res = json.loads(msg_parts[-1].decode())
-    if res["result"] != "ok":
-        await g.sock_ctl.send_multipart(msg_parts)
-        return
-    if ob_levels > 0 and ob is not None:
-        res["content"]["order_book"] = ob
-    msg_bytes = " " + json.dumps(res)
-    msg_bytes = msg_bytes.encode()
-    await g.sock_ctl.send_multipart(ident + [b"", msg_bytes])
-
-def construct_ob_levels_from_cache(cache, num_levels):
-    ob = cache["order_book"]
-    def handle_book(book):
-        res = []
-        for i, lvl in enumerate(book.items()):
-            if i == num_levels:
-                break
-            price_i, size = lvl
-            price_f = ob.i2f_conv(price_i)
-            res.append([price_f, size])
-        return res
-    bids = handle_book(ob._bids)
-    implied_bids = handle_book(ob._implied_bids)
-    asks = handle_book(ob._asks)
-    implied_asks = handle_book(ob._implied_asks)
-    res = {
-        "asks": asks,
-        "bids": bids,
-        "implied_asks": implied_asks,
-        "implied_bids": implied_bids,
-    }
-    return res
-
-async def get_status(ident, msg):
-    msg_bytes = (" " + json.dumps(msg)).encode()
-    await g.sock_deal.send_multipart(ident + [b"", msg_bytes])
-    msg_parts = await g.sock_deal_pub.poll_for_msg_id(msg["msg_id"])
-    msg = json.loads(msg_parts[-1].decode())
-    content = msg["content"]
-    status = {
-        "name": MODULE_NAME,
-        "num_cached_order_books": len([x for x in g.cache if x != 0]),
-        "status": g.status,
-        "uptime": (datetime.utcnow() - g.startup_time).total_seconds(),
-        "pub_bytes_in": g.pub_bytes_in,
-        "pub_bytes_out": g.pub_bytes_out,
-    }
-    content = [status] + content
-    msg["content"] = content
-    msg_bytes = (" " + json.dumps(msg)).encode()
-    await g.sock_ctl.send_multipart(ident + [b"", msg_bytes])
-
 def main():
     global L
     args = parse_args()
@@ -564,7 +559,6 @@ def main():
     L.info("checking md capabilities ...")
     g.loop.run_until_complete(check_capabilities())
     L.info("md capabilities ok")
-    L.info("starting proxy ...")
     tasks = [
         create_task(run_md_converter()),
         create_task(run_ctl_interceptor()),
