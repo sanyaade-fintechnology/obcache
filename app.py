@@ -37,6 +37,32 @@ g.pub_bytes_in = 0
 g.pub_bytes_out = 0
 g.status = "ok"
 
+################################### HELPERS ###################################
+
+def pack_msg(msg : dict):
+    if "msg_id" not in msg:
+        msg["msg_id"] = str(uuid.uuid4())
+    return (" " + json.dumps(msg)).encode()
+
+def unpack_msg(msg : bytes):
+    return json.loads(msg.decode())
+
+async def send_recv_command_raw(sock, msg):
+    msg_bytes = pack_msg(msg)
+    msg_id = msg["msg_id"]
+    await sock.send_multipart([b"", msg_bytes])
+    # this will wipe the message queue
+    while True:
+        msg_parts = await sock.recv_multipart()
+        try:
+            msg = json.loads(msg_parts[-1].decode())
+            if msg["msg_id"] == msg_id:
+                break
+        except:
+            pass
+    error.check_message(msg)
+    return msg["content"]
+
 ###############################################################################
 
 class OrderBook:
@@ -531,17 +557,9 @@ def init_zmq_sockets(args):
 
 async def check_capabilities():
     # meant to be run only at the initialization phase
-    data = { "command": "list_capabilities", "msg_id": str(uuid.uuid4()) }
-    msg_bytes = (" " + json.dumps(data)).encode()
-    await g.sock_deal.send_multipart([b"", msg_bytes])
-    msg_parts = await g.sock_deal.recv_multipart()
-    msg = json.loads(msg_parts[1].decode())
-    try:
-        error.check_message(msg)
-    except RemoteException as err:
-        L.exception("error requesting list_capabilities:")
-        sys.exit(1)
-    if "GET_TICKER_INFO_PRICE_TICK_SIZE" not in msg["content"]:
+    msg = {"command": "list_capabilities"}
+    caps = await send_recv_command_raw(g.sock_deal, msg)
+    if "GET_TICKER_INFO_PRICE_TICK_SIZE" not in caps:
         L.critical("MD does not support GET_TICKER_INFO_PRICE_TICK_SIZE cap")
         sys.exit(1)
 
