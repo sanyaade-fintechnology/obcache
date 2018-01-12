@@ -7,6 +7,7 @@ import sys
 import logging
 import json
 import argparse
+from copy import deepcopy
 from zmapi.codes import error
 from zmapi.codes.error import RemoteException
 from zmapi.zmq import SockRecvPublisher
@@ -21,6 +22,7 @@ from zmapi.logging import setup_root_logger
 ################################## CONSTANTS ##################################
 
 MODULE_NAME = "obcache"
+DEBUG = None  # set from args
 
 ################################### GLOBALS ###################################
 
@@ -36,6 +38,11 @@ g.startup_time = datetime.utcnow()
 g.pub_bytes_in = 0
 g.pub_bytes_out = 0
 g.status = "ok"
+g.subscriptions = {}
+# caps to be added to get_capabilities
+g.caps_to_add = []
+# caps to be removed from get_capabilities
+g.caps_to_del = []
 
 ################################### HELPERS ###################################
 
@@ -63,11 +70,27 @@ async def send_recv_command_raw(sock, msg):
     error.check_message(msg)
     return msg["content"]
 
+def dict_diff(x, y):
+    # does not check keys that y has but x does not have
+    res = {}
+    for k in x:
+        if k not in y:
+            res[k] = x[k]
+        elif x[k] != y[k]:
+            res[k] = x[k]
+    return res
+
 ###############################################################################
+
+# OrderBook is programmed in a fragile way, defensive programming principles
+# are not followed here. This is a sacrifice made for performance gains.
+# A lot of mutation and data sharing is used and that has to be programmed
+# with extreme care.
 
 class OrderBook:
 
-    def __init__(self, ticker_id, r2i_converter, i2r_converter, float_volume):
+    def __init__(self, ticker_id, r2i_converter, i2r_converter, float_volume,
+                 emit_quotes):
         self.r2i_conv = r2i_converter
         self.i2r_conv = i2r_converter
         # descending order
@@ -76,39 +99,15 @@ class OrderBook:
         # ascending order
         self._asks = SortedDict()
         self._implied_asks = SortedDict()
-        self._max_bid = None
-        self._min_ask = None
+        self._best_bid = -sys.maxsize
+        self._best_ask = sys.maxsize
         self._ticker_id = ticker_id
         if float_volume:
             self._zero_size = 0.0
         else:
             self._zero_size = 0
         self.initialized = False
-
-    def update(self, data):
-        updates = {
-            "bids": {},
-            "asks": {},
-            "implied_bids": {},
-            "implied_asks": {},
-        }
-        self._update_book(data, "bids", updates)
-        self._update_book(data, "implied_bids", updates)
-        self._update_book(data, "asks", updates)
-        self._update_book(data, "implied_asks", updates)
-        self._update_bbo_and_sanitize(updates)
-        self._convert_update_book_to_list("bids", updates, True)
-        self._convert_update_book_to_list("implied_bids", updates, True)
-        self._convert_update_book_to_list("asks", updates, False)
-        self._convert_update_book_to_list("implied_asks", updates, False)
-        self._maybe_flag_initialized()
-        return updates
-
-    def _maybe_flag_initialized(self):
-        if self.initialized:
-            return
-        if self._bids and self._asks:
-            self.initialized = True
+        self.emit_quotes = emit_quotes
 
     def _merge_level_to_book(self, i_price, book, new_lvl):
         """Merge level to the book.
@@ -153,100 +152,55 @@ class OrderBook:
                 upd_lvl = {"size": 0}
             upd_book[i_price] = upd_lvl
 
-    # mutates updates
-    def _convert_update_book_to_list(self, book_name, updates, reverse):
-        upd_book = updates[book_name]
-        res = []
-        for i_price in sorted(upd_book):
-            d = {"price": self.i2r_conv(i_price)}
-            d.update(upd_book[i_price])
-            res.append(d)
-        if reverse:
-            res = res[::-1]
-        updates[book_name] = res
-
-    # mutates updates
-    def _update_bbo_and_sanitize(self, updates):
-        # Aggression values are used to implement sweeping logic when
-        # max_bid/min_ask overlap.
-        bid_aggression, ask_aggression = self._update_bbo()
-        # check for overlapping levels
-        if self._min_ask is not None and self._max_bid is not None \
-                and self._max_bid >= self._min_ask:
-            L.debug("bid_aggr: {}, ask_aggr: {}"
-                    .format(bid_aggression, ask_aggression))
-            if ask_aggression <= 0 and bid_aggression <= 0:
-                L.critical("max_bid/min_ask are overlapping and aggression "
-                           "is <= 0 on both sides, assertion failed")
-                sys.exit(1)
-            if ask_aggression > 0 and ask_aggression < sys.maxsize \
-                    and bid_aggression > 0 and bid_aggression < sys.maxsize:
-                # Should not happen unless md vendor gives emits bad data.
-                # In that case more dominating side will be the one overwriting
-                # the other side.
-                L.warning("{}: inconsistent update, bid/ask clash, "
-                          "both sides aggressive".format(self._ticker_id))
-            # Decided to let bid dominate in the extremely rare cases where
-            # bid_aggression == ask_aggression (problematic md data feed).
-            if bid_aggression >= ask_aggression:
-                min_ask = sys.maxsize
-                min_ask = min(min_ask,
-                              self._sweep_book("asks", False, updates))
-                min_ask = min(min_ask,
-                              self._sweep_book("implied_asks", False, updates))
-                self._min_ask = min_ask if min_ask < sys.maxsize else None
-            else:
-                max_bid = -sys.maxsize
-                max_bid = max(max_bid,
-                              self._sweep_book("bids", True, updates))
-                max_bid = max(max_bid,
-                              self._sweep_book("implied_bids", True, updates))
-                self._max_bid = max_bid if max_bid > -sys.maxsize else None
-
     def _repr_bbo(self):
-        s = "{}: bbo={}/{}"
-        s = s.format(self._ticker_id,
-                     self.i2r_conv(self._max_bid) if self._max_bid else None,
-                     self.i2r_conv(self._min_ask) if self._min_ask else None)
-        if self._max_bid is not None and self._min_ask is not None:
-            s += " ({:.5%})".format(self._min_ask / self._max_bid - 1)
+        if self._best_bid == -sys.maxsize:
+            best_bid = None
+        else:
+            best_bid = self.i2r_conv(self._best_bid)
+        if self._best_ask == sys.maxsize:
+            best_ask = None
+        else:
+            best_ask = self.i2r_conv(self._best_ask)
+        s = "{}: bbo={}/{}".format(self._ticker_id, best_bid, best_ask)
+        if best_ask and best_bid:
+            s += " ({:.5%})".format(best_ask / best_bid - 1)
         return s
 
     def _update_bbo(self):
         changed = False
-        max_bid = -sys.maxsize
+        best_bid = -sys.maxsize
         # top of the book is always highest
         if self._bids:
-            max_bid = max(max_bid, next(iter(self._bids)))
+            best_bid = max(best_bid, self._bids.iloc[0])
         if self._implied_bids:
-            max_bid = max(max_bid, next(iter(self._implied_bids)))
+            best_bid = max(best_bid, self._implied_bids.iloc[0])
         bid_aggression = 0
-        if self._max_bid is None:
-            if max_bid > -sys.maxsize:
-                self._max_bid = max_bid
+        if self._best_bid == -sys.maxsize:
+            if best_bid > -sys.maxsize:
+                self._best_bid = best_bid
                 # sys.maxsize is used here to express appearance of first bid.
                 bid_aggression = sys.maxsize
                 changed = True
-        elif max_bid != self._max_bid:
-            bid_aggression = max_bid - self._max_bid
-            self._max_bid = max_bid
+        elif best_bid != self._best_bid:
+            bid_aggression = best_bid - self._best_bid
+            self._best_bid = best_bid
             changed = True
-        min_ask = sys.maxsize
+        best_ask = sys.maxsize
         # top of the book is always lowest
         if self._asks:
-            min_ask = min(min_ask, next(iter(self._asks)))
+            best_ask = min(best_ask, self._asks.iloc[0])
         if self._implied_bids:
-            min_ask = min(min_ask, next(iter(self._implied_asks)))
+            best_ask = min(best_ask, self._implied_asks.iloc[0])
         ask_aggression = 0
-        if self._min_ask is None:
-            if min_ask < sys.maxsize:
-                self._min_ask = min_ask
+        if self._best_ask is sys.maxsize:
+            if best_ask < sys.maxsize:
+                self._best_ask = best_ask
                 # sys.maxsize is used here to express appearance of first ask.
                 ask_aggression = sys.maxsize
                 changed = True
-        elif min_ask != self._min_ask:
-            ask_aggression = self._min_ask - min_ask
-            self._min_ask = min_ask
+        elif best_ask != self._best_ask:
+            ask_aggression = self._best_ask - best_ask
+            self._best_ask = best_ask
             changed = True
         if changed:
             L.debug(self._repr_bbo())
@@ -266,15 +220,225 @@ class OrderBook:
         for i_price in book:
             # When size is 0, the other fields don't have any meaning and
             # don't need to be included.
-            if is_bid and i_price >= self._min_ask:
+            if is_bid and i_price >= self._best_ask:
                 del book[i_price]
                 upd_book[i_price] = {"size": self._zero_size}
-            elif not is_bid and i_price <= self._max_bid:
+            elif not is_bid and i_price <= self._best_bid:
                 del book[i_price]
                 upd_book[i_price] = {"size": self._zero_size}
             else:
                 return i_price
         return -sys.maxsize if is_bid else sys.maxsize
+
+    # mutates updates
+    def _update_bbo_and_sanitize(self, updates):
+        # Aggression values are used to implement sweeping logic when
+        # best_bid/best_ask overlap.
+        bid_aggression, ask_aggression = self._update_bbo()
+        # check for overlapping levels
+        if self._best_ask != sys.maxsize and self._best_bid != -sys.maxsize \
+                and self._best_bid >= self._best_ask:
+            L.debug("bid_aggr: {}, ask_aggr: {}"
+                    .format(bid_aggression, ask_aggression))
+            if ask_aggression <= 0 and bid_aggression <= 0:
+                L.critical("best_bid/best_ask are overlapping and aggression "
+                           "is <= 0 on both sides, assertion failed")
+                sys.exit(1)
+            if ask_aggression > 0 and ask_aggression < sys.maxsize \
+                    and bid_aggression > 0 and bid_aggression < sys.maxsize:
+                # Should not happen unless md vendor gives emits bad data.
+                # In that case more dominating side will be the one overwriting
+                # the other side.
+                L.warning("{}: inconsistent update, bid/ask clash, "
+                          "both sides aggressive".format(self._ticker_id))
+            # Decided to let bid dominate in the extremely rare cases where
+            # bid_aggression == ask_aggression (problematic md data feed).
+            if bid_aggression >= ask_aggression:
+                best_ask = sys.maxsize
+                best_ask = min(best_ask,
+                              self._sweep_book("asks", False, updates))
+                best_ask = min(best_ask,
+                              self._sweep_book("implied_asks", False, updates))
+            else:
+                best_bid = -sys.maxsize
+                best_bid = max(best_bid,
+                              self._sweep_book("bids", True, updates))
+                best_bid = max(best_bid,
+                              self._sweep_book("implied_bids", True, updates))
+        return bid_aggression != 0, ask_aggression != 0
+
+    def _maybe_flag_initialized(self):
+        if self.initialized:
+            return
+        if self._bids and self._asks:
+            self.initialized = True
+
+    # mutates updates
+    def _convert_update_book_to_list(self, book_name, updates, reverse):
+        upd_book = updates[book_name]
+        res = []
+        for i_price in sorted(upd_book):
+            d = {"price": self.i2r_conv(i_price)}
+            d.update(upd_book[i_price])
+            res.append(d)
+        if reverse:
+            res = res[::-1]
+        updates[book_name] = res
+
+    # mutates updates
+    def _convert_updates_to_list(self, updates):
+        self._convert_update_book_to_list("bids", updates, True)
+        self._convert_update_book_to_list("implied_bids", updates, True)
+        self._convert_update_book_to_list("asks", updates, False)
+        self._convert_update_book_to_list("implied_asks", updates, False)
+
+    # mutates updates
+    def _mutate_book(self, data, updates):
+        self._update_book(data, "bids", updates)
+        self._update_book(data, "implied_bids", updates)
+        self._update_book(data, "asks", updates)
+        self._update_book(data, "implied_asks", updates)
+        self._update_bbo_and_sanitize(updates)
+        self._maybe_flag_initialized()
+        self._convert_updates_to_list(updates)
+
+    def _generate_quotes(self, bb_changed, ba_changed):
+        res = {}
+        if bb_changed:
+            i_price = self._best_bid
+            if i_price == -sys.maxsize:
+                res["best_bid"] = {}
+            else:
+                lvl = self._bids.get(i_price)
+                if not lvl:
+                    lvl = self._implied_bids[i_price]
+                d = dict(lvl)
+                d["price"] = self.i2r_conv(i_price)
+                res["best_bid"] = d
+        if ba_changed:
+            i_price = self._best_ask
+            if i_price == sys.maxsize:
+                res["best_ask"] = {}
+            else:
+                lvl = self._asks.get(i_price)
+                if not lvl:
+                    lvl = self._implied_asks[i_price]
+                d = dict(lvl)
+                d["price"] = self.i2r_conv(i_price)
+                res["best_ask"] = d
+        return res
+
+    def _get_best_bid_lvl(self):
+        i_price = self._best_bid
+        if i_price == -sys.maxsize:
+            return {}
+        else:
+            lvl = self._bids.get(i_price)
+            if not lvl:
+                lvl = self._implied_bids[i_price]
+            d = dict(lvl)
+            d["price"] = i_price
+            return d
+
+    def _get_best_ask_lvl(self):
+        i_price = self._best_ask
+        if i_price == sys.maxsize:
+            return {}
+        else:
+            lvl = self._asks.get(i_price)
+            if not lvl:
+                lvl = self._implied_asks[i_price]
+            d = dict(lvl)
+            d["price"] = i_price
+            return d
+
+    def update(self, data):
+        updates = {
+            "bids": {},
+            "asks": {},
+            "implied_bids": {},
+            "implied_asks": {},
+        }
+        if self.emit_quotes:
+            prev_bb = self._get_best_bid_lvl()
+            prev_ba = self._get_best_ask_lvl()
+        self._mutate_book(data, updates)
+        quotes = {}
+        if self.emit_quotes:
+            # Should be ok to compare floats because no arithmetic operations
+            # have been performed with them?
+            diff = dict_diff(self._get_best_bid_lvl(), prev_bb)
+            if diff:
+                if "price" in diff:
+                    diff["price"] = self.i2r_conv(diff["price"])
+                quotes["best_bid"] = diff
+            diff = dict_diff(self._get_best_ask_lvl(), prev_ba)
+            if diff:
+                if "price" in diff:
+                    diff["price"] = self.i2r_conv(diff["price"])
+                quotes["best_ask"] = diff
+            if quotes:
+                quotes["timestamp"] = data["timestamp"]
+        return updates, quotes
+
+class TruncatedOrderBook(OrderBook):
+    """OrderBook with order_book_levels emulation."""
+
+    def __init__(self, ticker_id, r2i_converter, i2r_converter, float_volume,
+                 emit_quotes, max_levels):
+        super().__init__(ticker_id, r2i_converter, i2r_converter, float_volume,
+                         emit_quotes)
+        # descending order
+        self._bids_tr = deepcopy(self._bids)
+        self._implied_bids_tr = deepcopy(self._implied_bids)
+        # ascending order
+        self._asks_tr = deepcopy(self._asks)
+        self._implied_asks_tr = deepcopy(self._implied_asks)
+        self.max_levels = max_levels
+
+    def _update_truncated_books(self, updates):
+        for book_name, upd_book in updates.items():
+            book = self.__dict__.get("_" + book_name)
+            book_tr = self.__dict__.get("_" + book_name + "_tr")
+            # update book_tr based on updates
+            for i_price, upd_lvl in upd_book.items():
+                if upd_lvl["size"] == 0:
+                    try:
+                        del book_tr[i_price]
+                    except KeyError:
+                        pass
+                else:
+                    book_tr[i_price] = upd_lvl
+            tr_len = len(book_tr)
+            if tr_len < self.max_levels:
+                # Check for potential redisplay of data. This is why full books
+                # are required.
+                i_prices_to_add = book.iloc[tr_len:self.max_levels]
+                for i_price in i_prices_to_add:
+                    lvl = book[i_price]
+                    book_tr[i_price] = lvl
+                    upd_book[i_price] = lvl
+            elif tr_len > self.max_levels:
+                i_prices_to_del = book_tr.iloc[self.max_levels:]
+                for i_price in i_prices_to_del:
+                    del book_tr[i_price]
+                    upd_book[i_price] = {"size": 0}
+            if DEBUG:
+                assert len(book_tr) <= self.max_levels, len(book_tr)
+                if len(book) >= self.max_levels:
+                    assert len(book_tr) == self.max_levels, len(book_tr)
+                for i_price, lvl in book_tr.items():
+                    assert lvl == book[i_price]
+
+    def _mutate_book(self, data, updates):
+        self._update_book(data, "bids", updates)
+        self._update_book(data, "implied_bids", updates)
+        self._update_book(data, "asks", updates)
+        self._update_book(data, "implied_asks", updates)
+        self._update_bbo_and_sanitize(updates)
+        self._update_truncated_books(updates)
+        self._maybe_flag_initialized()
+        self._convert_updates_to_list(updates)
 
 ################################ MD CONVERTER #################################
 
@@ -321,41 +485,69 @@ def get_converters(data):
             return x
     return r2i_converter, i2r_converter
 
+async def send_quotes(ticker_id : bytes, quotes):
+    msg_bytes = (" " + json.dumps(quotes)).encode()
+    g.sock_pub.send_multipart([ticker_id + b"\x03", msg_bytes])
+
 # mutates data
 async def convert_data(ticker_id: bytes, data):
     cache = g.cache.get(ticker_id)
+    ticker_id_str = ticker_id.decode()
+    sub_def = g.subscriptions[ticker_id_str]
+    # TODO: in rare cases if sub_def is not found, get_subscriptions again
     if not cache:
         g.cache[ticker_id] = cache = {}
-        ticker_id_str = ticker_id.decode()
+        # Don't need to send clear updates if order_book_levels is 0 at
+        # application startup time.
         L.info("fetching ticker info for {} ...".format(ticker_id_str))
         try:
             ticker_info = await get_ticker_info(ticker_id_str)
             r2i_converter, i2r_converter = get_converters(ticker_info)
-        except Exceptions as err:
+        except Exception as err:
             L.exception("failed to fetch ticker_info for {}:"
                         .format(ticker_id_str))
             L.warning("ignored {}".format(ticker_id_str))
             g.cache[ticker_id] = 0
             return data
         L.info("price converter constructed for: {}".format(ticker_id_str))
-        cache["order_book"] = OrderBook(ticker_id,
-                                        r2i_converter,
-                                        i2r_converter,
-                                        ticker_info["float_volume"])
+        emit_quotes = sub_def["emit_quotes"]
+        if g.native_ob_levels:
+            L.info("creating new order book for {} ...".format(ticker_id_str))
+            cache["order_book"] = OrderBook(ticker_id,
+                                            r2i_converter,
+                                            i2r_converter,
+                                            ticker_info["float_volume"],
+                                            emit_quotes)
+        else:
+            max_levels = sub_def["order_book_levels"]
+            L.info("creating new order book for {} (max_levels: {}) ..."
+                   .format(ticker_id_str, max_levels))
+            cache["order_book"] = TruncatedOrderBook(
+                    ticker_id, r2i_converter, i2r_converter, 
+                    ticker_info["float_volume"], emit_quotes, max_levels)
+        cache["cleared"] = True
     # print("INPUT")
     # pprint(data)
     ob = cache["order_book"]
-    updates = ob.update(data)
+    updates, quotes = ob.update(data)
     # print("OUTPUT")
     # pprint(updates)
-    if updates["bids"]:
-        data["bids"] = updates["bids"]
-    if updates["implied_bids"]:
-        data["implied_bids"] = updates["implied_bids"]
-    if updates["asks"]:
-        data["asks"] = updates["asks"]
-    if updates["implied_asks"]:
-        data["implied_asks"] = updates["implied_asks"]
+    if quotes:
+        await send_quotes(ticker_id, quotes)
+    if sub_def["order_book_levels"] > 0 or not cache["cleared"]:
+        if updates["bids"]:
+            data["bids"] = updates["bids"]
+        if updates["implied_bids"]:
+            data["implied_bids"] = updates["implied_bids"]
+        if updates["asks"]:
+            data["asks"] = updates["asks"]
+        if updates["implied_asks"]:
+            data["implied_asks"] = updates["implied_asks"]
+        cache["cleared"] = True
+        return data
+    else:
+        # don't emit any depth updates
+        return None
 
 async def convert_md_msg(ticker_id: bytes, msg):
     if g.cache.get(ticker_id) == 0:  # ignored ticker_id
@@ -368,9 +560,10 @@ async def convert_md_msg(ticker_id: bytes, msg):
             pass
         return msg
     data = json.loads(msg.decode())
-    await convert_data(ticker_id, data)
-    msg = (" " + json.dumps(data)).encode()
-    return msg
+    data = await convert_data(ticker_id, data)
+    if not data:
+        return None
+    return (" " + json.dumps(data)).encode()
 
 async def handle_md_msg(ticker_id: bytes, msg_parts):
     g.pub_bytes_in += sum([len(x) for x in msg_parts])
@@ -380,8 +573,9 @@ async def handle_md_msg(ticker_id: bytes, msg_parts):
     except Exception as err:
         L.exception("exception when converting message:", err)
     else:
-        g.pub_bytes_out += len(topic) + len(msg_bytes)
-        await g.sock_pub.send_multipart([topic, msg_bytes])
+        if msg_bytes:
+            g.pub_bytes_out += len(topic) + len(msg_bytes)
+            await g.sock_pub.send_multipart([topic, msg_bytes])
 
 async def run_md_converter():
     L.info("running md converter coroutine...")
@@ -407,6 +601,7 @@ async def fwd_message_no_change(msg_id, msg_parts):
     await g.sock_deal.send_multipart(msg_parts)
     res = await g.sock_deal_pub.poll_for_msg_id(msg_id)
     await g.sock_ctl.send_multipart(res)
+    return res
 
 def construct_ob_levels_from_cache(cache, num_levels):
     ob = cache["order_book"]
@@ -463,7 +658,7 @@ async def handle_get_snapshot(ident, msg):
     msg_bytes = msg_bytes.encode()
     await g.sock_ctl.send_multipart(ident + [b"", msg_bytes])
 
-async def get_status(ident, msg):
+async def handle_get_status(ident, msg):
     msg_bytes = (" " + json.dumps(msg)).encode()
     await g.sock_deal.send_multipart(ident + [b"", msg_bytes])
     msg_parts = await g.sock_deal_pub.poll_for_msg_id(msg["msg_id"])
@@ -482,6 +677,48 @@ async def get_status(ident, msg):
     msg_bytes = (" " + json.dumps(msg)).encode()
     await g.sock_ctl.send_multipart(ident + [b"", msg_bytes])
 
+async def handle_subscribe(ident, msg, msg_raw):
+    msg_parts = await fwd_message_no_change(msg["msg_id"],
+                                            ident + [b"", msg_raw])
+    res = json.loads(msg_parts[-1].decode())
+    if g.native_ob_levels:
+        return
+    content = msg["content"]
+    # only make changes to module state if there's no error
+    if res["result"] == "ok":
+        ticker_id = content["ticker_id"]
+        # unsubscribe
+        if content["order_book_speed"] == 0 \
+                and content["trades_speed"] == 0 \
+                and not content["emit_quotes"]:
+            try:
+                del g.subscriptions[ticker_id]
+            except KeyError:
+                pass
+        else:
+            old_sub_def = g.subscriptions.get(ticker_id)
+            sub_def = dict(content)
+            del sub_def["ticker_id"]
+            g.subscriptions[ticker_id] = sub_def
+            cache = g.cache.get(ticker_id.encode())
+            if cache:
+                ob = cache["order_book"]
+                s = ""
+                if not g.native_ob_levels:
+                    if not old_sub_def or \
+                            sub_def["order_book_levels"] != \
+                            old_sub_def["order_book_levels"]:
+                        # If order_book_levels is turned to 0, clearing updates
+                        # shall be emitted.
+                        cache["cleared"] = False
+                        ob.max_levels = sub_def["order_book_levels"]
+                        s += " max_levels={}".format(ob.max_levels)
+                if not g.native_quotes:
+                    ob.emit_quotes = sub_def["emit_quotes"]
+                    s += " emit_quotes={}".format(ob.emit_quotes)
+                if s:
+                    L.info("{}:{}".format(ticker_id, s))
+
 async def handle_ctl_msg_1(ident, msg_raw):
     msg = json.loads(msg_raw.decode())
     msg_id = msg["msg_id"]
@@ -493,7 +730,9 @@ async def handle_ctl_msg_1(ident, msg_raw):
         if cmd == "get_snapshot":
             await handle_get_snapshot(ident, msg)
         elif cmd == "get_status":
-            await get_status(ident, msg)
+            await handle_get_status(ident, msg)
+        elif cmd == "subscribe":
+            await handle_subscribe(ident, msg, msg_raw)
         else:
             await fwd_message_no_change(msg_id, ident + [b"", msg_raw])
     except Exception as e:
@@ -532,6 +771,12 @@ def parse_args():
     parser.add_argument("pub_addr_down",
                         help="pub socket binding address")
     parser.add_argument("--log-level", default="INFO", help="logging level")
+    parser.add_argument("--debug", action="store_true",
+                        help="enable debug mode")
+    parser.add_argument("-a", "--all-levels", action="store_true",
+                        help="do not emulate order_book_levels")
+    parser.add_argument("--no-quotes", action="store_true",
+                        help="do not emulate quotes updates")
     args = parser.parse_args()
     try:
         args.log_level = int(args.log_level)
@@ -555,27 +800,51 @@ def init_zmq_sockets(args):
     g.sock_pub = g.ctx.socket(zmq.PUB)
     g.sock_pub.bind(args.pub_addr_down)
 
-async def check_capabilities():
-    # meant to be run only at the initialization phase
+async def init_check_capabilities(args):
     msg = {"command": "list_capabilities"}
     caps = await send_recv_command_raw(g.sock_deal, msg)
     if "GET_TICKER_INFO_PRICE_TICK_SIZE" not in caps:
         L.critical("MD does not support GET_TICKER_INFO_PRICE_TICK_SIZE cap")
         sys.exit(1)
+    g.native_sane_ob = "SANE_ORDER_BOOK" in caps
+    g.native_ob_levels = "ORDER_BOOK_LEVELS" in caps
+    g.native_quotes = "PUB_QUOTES" in caps
+    if not g.native_sane_ob and g.native_ob_levels:
+        L.critical("illegal caps: ORDER_BOOK_LEVELS defined "
+                   "without SANE_ORDER_BOOK")
+        sys.exit(1)
+    g.native_ob_levels |= args.all_levels
+    g.native_quotes |= args.no_quotes
+    if g.native_sane_ob and g.native_ob_levels and g.native_quotes:
+        L.critical("nothing to do, please remove this module from this chain")
+        sys.exit(1)
+
+async def init_get_subscriptions():
+    msg = {"command": "get_subscriptions"}
+    g.subscriptions = await send_recv_command_raw(g.sock_deal, msg)
 
 def main():
-    global L
+    global DEBUG
     args = parse_args()
+    DEBUG = args.debug
     setup_logging(args)
+    if DEBUG:
+        L.info("debug mode activated")
     init_zmq_sockets(args)
     L.info("checking md capabilities ...")
-    g.loop.run_until_complete(check_capabilities())
+    g.loop.run_until_complete(init_check_capabilities(args))
     L.info("md capabilities ok")
+    if not g.native_ob_levels:
+        g.loop.run_until_complete(init_get_subscriptions())
+        if g.subscriptions:
+            L.info("{} active subscription(s) found"
+                   .format(len(g.subscriptions)))
     tasks = [
-        create_task(run_md_converter()),
-        create_task(run_ctl_interceptor()),
-        create_task(g.sock_deal_pub.run()),
+        run_md_converter(),
+        run_ctl_interceptor(),
+        g.sock_deal_pub.run(),
     ]
+    tasks = [create_task(coro_obj) for coro_obj in tasks]
     g.loop.run_until_complete(asyncio.gather(*tasks))
 
 
