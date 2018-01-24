@@ -559,11 +559,14 @@ async def run_md_converter():
     L.info("running md converter coroutine...")
     while True:
         msg_parts = await g.sock_sub.recv_multipart()
+        ticker_id = msg_parts[0][:-1]
+        if ticker_id.decode() not in g.subscriptions:
+            # skip message if subscription doesn't exist
+            continue
         msg_type = msg_parts[0][-1]
         if msg_type != 1:
             await g.sock_pub.send_multipart(msg_parts)
             continue
-        ticker_id = msg_parts[0][:-1]
         create_task(handle_md_msg(ticker_id, msg_parts))
 
 ############################### CTL INTERCEPTOR ###############################
@@ -670,6 +673,7 @@ async def handle_modify_subscription(ident, msg, msg_raw):
     #             max(1, new_sub_def.order_book_levels)
     if new_sub_def.empty():
         g.subscriptions.pop(ticker_id, "")
+        g.cache.pop(ticker_id.encode(), None)
     else:
         g.subscriptions[ticker_id] = new_sub_def
     await g.sock_deal.send_multipart(ident + [b"", msg_raw])
