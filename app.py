@@ -12,12 +12,14 @@ from zmapi.codes import error
 from zmapi.codes.error import RemoteException
 from zmapi.zmq import SockRecvPublisher
 import uuid
+from collections import defaultdict
 from sortedcontainers import SortedDict
 from time import gmtime
 from pprint import pprint, pformat
 from datetime import datetime
 from zmapi.zmq.utils import split_message, ident_to_str
 from zmapi.logging import setup_root_logger
+from zmapi import SubscriptionDefinition
 
 ################################## CONSTANTS ##################################
 
@@ -38,7 +40,7 @@ g.startup_time = datetime.utcnow()
 g.pub_bytes_in = 0
 g.pub_bytes_out = 0
 g.status = "ok"
-g.subscriptions = {}
+g.subscriptions = defaultdict(SubscriptionDefinition)
 # caps to be added to get_capabilities
 g.caps_to_add = []
 # caps to be removed from get_capabilities
@@ -79,6 +81,7 @@ def dict_diff(x, y):
         elif x[k] != y[k]:
             res[k] = x[k]
     return res
+
 
 ###############################################################################
 
@@ -302,32 +305,6 @@ class OrderBook:
         self._maybe_flag_initialized()
         self._convert_updates_to_list(updates)
 
-    def _generate_quotes(self, bb_changed, ba_changed):
-        res = {}
-        if bb_changed:
-            i_price = self._best_bid
-            if i_price == -sys.maxsize:
-                res["best_bid"] = {}
-            else:
-                lvl = self._bids.get(i_price)
-                if not lvl:
-                    lvl = self._implied_bids[i_price]
-                d = dict(lvl)
-                d["price"] = self.i2r_conv(i_price)
-                res["best_bid"] = d
-        if ba_changed:
-            i_price = self._best_ask
-            if i_price == sys.maxsize:
-                res["best_ask"] = {}
-            else:
-                lvl = self._asks.get(i_price)
-                if not lvl:
-                    lvl = self._implied_asks[i_price]
-                d = dict(lvl)
-                d["price"] = self.i2r_conv(i_price)
-                res["best_ask"] = d
-        return res
-
     def _get_best_bid_lvl(self):
         i_price = self._best_bid
         if i_price == -sys.maxsize:
@@ -371,13 +348,15 @@ class OrderBook:
             if diff:
                 if "price" in diff:
                     diff["price"] = self.i2r_conv(diff["price"])
-                quotes["best_bid"] = diff
+                for k, v in diff.items():
+                    quotes["bid_" + k] = v
             diff = dict_diff(self._get_best_ask_lvl(), prev_ba)
             if diff:
                 if "price" in diff:
                     diff["price"] = self.i2r_conv(diff["price"])
-                quotes["best_ask"] = diff
-            if quotes:
+                for k, v in diff.items():
+                    quotes["ask_" + k] = v
+            if quotes and "timestamp" in data:
                 quotes["timestamp"] = data["timestamp"]
         return updates, quotes
 
@@ -494,7 +473,6 @@ async def convert_data(ticker_id: bytes, data):
     cache = g.cache.get(ticker_id)
     ticker_id_str = ticker_id.decode()
     sub_def = g.subscriptions[ticker_id_str]
-    # TODO: in rare cases if sub_def is not found, get_subscriptions again
     if not cache:
         g.cache[ticker_id] = cache = {}
         # Don't need to send clear updates if order_book_levels is 0 at
@@ -510,8 +488,8 @@ async def convert_data(ticker_id: bytes, data):
             g.cache[ticker_id] = 0
             return data
         L.info("price converter constructed for: {}".format(ticker_id_str))
-        emit_quotes = sub_def["emit_quotes"]
-        if g.native_ob_levels:
+        emit_quotes = sub_def.emit_quotes
+        if g.cap_ob_levels:
             L.info("creating new order book for {} ...".format(ticker_id_str))
             cache["order_book"] = OrderBook(ticker_id,
                                             r2i_converter,
@@ -519,7 +497,7 @@ async def convert_data(ticker_id: bytes, data):
                                             ticker_info["float_volume"],
                                             emit_quotes)
         else:
-            max_levels = sub_def["order_book_levels"]
+            max_levels = sub_def.order_book_levels
             L.info("creating new order book for {} (max_levels: {}) ..."
                    .format(ticker_id_str, max_levels))
             cache["order_book"] = TruncatedOrderBook(
@@ -534,7 +512,7 @@ async def convert_data(ticker_id: bytes, data):
     # pprint(updates)
     if quotes:
         await send_quotes(ticker_id, quotes)
-    if sub_def["order_book_levels"] > 0 or not cache["cleared"]:
+    if sub_def.order_book_levels > 0 or not cache["cleared"]:
         if updates["bids"]:
             data["bids"] = updates["bids"]
         if updates["implied_bids"]:
@@ -677,47 +655,51 @@ async def handle_get_status(ident, msg):
     msg_bytes = (" " + json.dumps(msg)).encode()
     await g.sock_ctl.send_multipart(ident + [b"", msg_bytes])
 
-async def handle_subscribe(ident, msg, msg_raw):
-    msg_parts = await fwd_message_no_change(msg["msg_id"],
-                                            ident + [b"", msg_raw])
-    res = json.loads(msg_parts[-1].decode())
-    if g.native_ob_levels:
-        return
+async def handle_modify_subscription(ident, msg, msg_raw):
     content = msg["content"]
-    # only make changes to module state if there's no error
-    if res["result"] == "ok":
-        ticker_id = content["ticker_id"]
-        # unsubscribe
-        if content["order_book_speed"] == 0 \
-                and content["trades_speed"] == 0 \
-                and not content["emit_quotes"]:
-            try:
-                del g.subscriptions[ticker_id]
-            except KeyError:
-                pass
-        else:
-            old_sub_def = g.subscriptions.get(ticker_id)
-            sub_def = dict(content)
-            del sub_def["ticker_id"]
-            g.subscriptions[ticker_id] = sub_def
-            cache = g.cache.get(ticker_id.encode())
-            if cache:
-                ob = cache["order_book"]
-                s = ""
-                if not g.native_ob_levels:
-                    if not old_sub_def or \
-                            sub_def["order_book_levels"] != \
-                            old_sub_def["order_book_levels"]:
-                        # If order_book_levels is turned to 0, clearing updates
-                        # shall be emitted.
-                        cache["cleared"] = False
-                        ob.max_levels = sub_def["order_book_levels"]
-                        s += " max_levels={}".format(ob.max_levels)
-                if not g.native_quotes:
-                    ob.emit_quotes = sub_def["emit_quotes"]
+    content_mod = dict(content)
+    ticker_id = content_mod.pop("ticker_id")
+    old_sub_def = g.subscriptions[ticker_id]
+    new_sub_def = deepcopy(old_sub_def)
+    new_sub_def.update(content_mod)
+    # if not g.cap_pub_quotes and new_sub_def.emit_quotes:
+    #     # Need order book subscription to emulate emit_quotes.
+    #     new_sub_def.order_book_speed = \
+    #             max(1, new_sub_def.order_book_speed)
+    #     new_sub_def.order_book_levels = \
+    #             max(1, new_sub_def.order_book_levels)
+    if new_sub_def.empty():
+        g.subscriptions.pop(ticker_id, "")
+    else:
+        g.subscriptions[ticker_id] = new_sub_def
+    await g.sock_deal.send_multipart(ident + [b"", msg_raw])
+    msg_parts = await g.sock_deal_pub.poll_for_msg_id(msg["msg_id"])
+    msg_bytes = msg_parts[-1]
+    msg = json.loads(msg_bytes.decode())
+    if msg["result"] == "ok":
+        cache = g.cache.get(ticker_id.encode())
+        if cache:
+            ob = cache["order_book"]
+            s = ""
+            if not g.cap_ob_levels:
+                if new_sub_def.order_book_levels != \
+                        old_sub_def.order_book_levels:
+                    # If order_book_levels is turned to 0, clearing updates
+                    # shall be emitted.
+                    cache["cleared"] = False
+                    ob.max_levels = new_sub_def.order_book_levels
+                    s += " max_levels={}".format(ob.max_levels)
+            if not g.cap_pub_quotes:
+                if not new_sub_def.emit_quotes != \
+                        old_sub_def.emit_quotes:
+                    ob.emit_quotes = new_sub_def.emit_quotes
                     s += " emit_quotes={}".format(ob.emit_quotes)
-                if s:
-                    L.info("{}:{}".format(ticker_id, s))
+            if s:
+                L.info("{}:{}".format(ticker_id, s))
+    else:
+        # revert changes
+        g.subscriptions[ticker_id] = old_sub_def
+    await g.sock_ctl.send_multipart(ident + [b"", msg_bytes])
 
 async def handle_ctl_msg_1(ident, msg_raw):
     msg = json.loads(msg_raw.decode())
@@ -731,8 +713,8 @@ async def handle_ctl_msg_1(ident, msg_raw):
             await handle_get_snapshot(ident, msg)
         elif cmd == "get_status":
             await handle_get_status(ident, msg)
-        elif cmd == "subscribe":
-            await handle_subscribe(ident, msg, msg_raw)
+        elif cmd == "modify_subscription":
+            await handle_modify_subscription(ident, msg, msg_raw)
         else:
             await fwd_message_no_change(msg_id, ident + [b"", msg_raw])
     except Exception as e:
@@ -806,22 +788,39 @@ async def init_check_capabilities(args):
     if "GET_TICKER_INFO_PRICE_TICK_SIZE" not in caps:
         L.critical("MD does not support GET_TICKER_INFO_PRICE_TICK_SIZE cap")
         sys.exit(1)
-    g.native_sane_ob = "SANE_ORDER_BOOK" in caps
-    g.native_ob_levels = "ORDER_BOOK_LEVELS" in caps
-    g.native_quotes = "PUB_QUOTES" in caps
-    if not g.native_sane_ob and g.native_ob_levels:
+    g.cap_sane_ob = "SANE_ORDER_BOOK" in caps
+    g.cap_ob_levels = "ORDER_BOOK_LEVELS" in caps
+    g.cap_pub_quotes = "PUB_QUOTES" in caps
+    if not g.cap_sane_ob and g.cap_ob_levels:
         L.critical("illegal caps: ORDER_BOOK_LEVELS defined "
                    "without SANE_ORDER_BOOK")
         sys.exit(1)
-    g.native_ob_levels |= args.all_levels
-    g.native_quotes |= args.no_quotes
-    if g.native_sane_ob and g.native_ob_levels and g.native_quotes:
+    g.cap_ob_levels |= args.all_levels
+    g.cap_pub_quotes |= args.no_quotes
+    if g.cap_sane_ob and g.cap_ob_levels and g.cap_pub_quotes:
         L.critical("nothing to do, please remove this module from this chain")
         sys.exit(1)
 
 async def init_get_subscriptions():
     msg = {"command": "get_subscriptions"}
-    g.subscriptions = await send_recv_command_raw(g.sock_deal, msg)
+    subs = await send_recv_command_raw(g.sock_deal, msg)
+    subs = {k: SubscriptionDefinition(**v) for k, v in subs.items()}
+    g.subscriptions.update(subs)
+    # if not g.cap_pub_quotes:
+    #     for tid, d in g.subscriptions.items():
+    #         if d.emit_quotes:
+    #             # Need order book subscription to emulate emit_quotes.
+    #             before = deepcopy(d)
+    #             d.order_book_speed = max(1, d.order_book_speed)
+    #             d.order_book_levels = max(1, d.order_book_levels)
+    #             if before != d:
+    #                 msg = {"command": "modify_subscription"}
+    #                 content = {"ticker_id": tid}
+    #                 content.update(d.__dict__)
+    #                 msg["content"] = content
+    #                 L.info("modifying existing subscription to {} ..."
+    #                        .format(tid))
+    #                 await send_recv_command_raw(g.sock_deal, msg)
 
 def main():
     global DEBUG
@@ -834,7 +833,7 @@ def main():
     L.info("checking md capabilities ...")
     g.loop.run_until_complete(init_check_capabilities(args))
     L.info("md capabilities ok")
-    if not g.native_ob_levels:
+    if not g.cap_ob_levels:
         g.loop.run_until_complete(init_get_subscriptions())
         if g.subscriptions:
             L.info("{} active subscription(s) found"
