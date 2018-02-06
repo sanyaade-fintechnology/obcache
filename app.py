@@ -131,6 +131,16 @@ class OrderBook:
         return changes
 
     # mutates updates
+    def _add_outside_deletions(self, levels, book, upd_book):
+        old_prices = set(book.keys())
+        new_prices = set([self.r2i_conv(x["price"]) for x in levels])
+        deleted_prices = old_prices.difference(new_prices)
+        for i_price in deleted_prices:
+            L.debug("deleted {}".format(i_price))
+            del book[i_price]
+            upd_book[i_price] = {"size": 0}
+
+    # mutates updates
     def _update_book(self, data, book_name, updates):
         levels = data.get(book_name)
         if not levels:
@@ -138,8 +148,12 @@ class OrderBook:
         attr_name = "_" + book_name
         book = self.__dict__.get(attr_name)
         upd_book = updates[book_name]
+        if not g.cap_ob_incremental:
+            self._add_outside_deletions(levels, book, upd_book)
         for lvl in levels:
             i_price = self.r2i_conv(lvl["price"])
+            s = "----\n{}\n{}"
+            s = s.format(pformat(lvl), pformat(book.get(i_price)))
             # 0 size means the level is wiped out
             if lvl["size"] == 0:
                 try:
@@ -150,10 +164,12 @@ class OrderBook:
                 # don't emit updates that actually change nothing
                 if not self._merge_level_to_book(i_price, book, lvl):
                     continue
+            # L.debug("{}: {}".format(book_name, len(book)))
             upd_lvl = book.get(i_price)
             if not upd_lvl:
                 upd_lvl = {"size": 0}
             upd_book[i_price] = upd_lvl
+            s += "\nupdate: {}".format(pformat(upd_lvl))
 
     def _repr_bbo(self):
         if self._best_bid == -sys.maxsize:
@@ -192,7 +208,7 @@ class OrderBook:
         # top of the book is always lowest
         if self._asks:
             best_ask = min(best_ask, self._asks.iloc[0])
-        if self._implied_bids:
+        if self._implied_asks:
             best_ask = min(best_ask, self._implied_asks.iloc[0])
         ask_aggression = 0
         if self._best_ask is sys.maxsize:
@@ -358,6 +374,9 @@ class OrderBook:
                     quotes["ask_" + k] = v
             if quotes and "timestamp" in data:
                 quotes["timestamp"] = data["timestamp"]
+        # for k, v in updates.items():
+        #     if v:
+        #         print("updates:", k, len(v))
         return updates, quotes
 
 class TruncatedOrderBook(OrderBook):
@@ -504,12 +523,12 @@ async def convert_data(ticker_id: bytes, data):
                     ticker_id, r2i_converter, i2r_converter, 
                     ticker_info["float_volume"], emit_quotes, max_levels)
         cache["cleared"] = True
-    # print("INPUT")
-    # pprint(data)
     ob = cache["order_book"]
     updates, quotes = ob.update(data)
-    # print("OUTPUT")
-    # pprint(updates)
+    data.pop("bids", None)
+    data.pop("asks", None)
+    data.pop("implied_bids", None)
+    data.pop("implied_asks", None)
     if quotes:
         await send_quotes(ticker_id, quotes)
     if sub_def.order_book_levels > 0 or not cache["cleared"]:
@@ -792,12 +811,17 @@ async def init_check_capabilities(args):
     if "GET_TICKER_INFO_PRICE_TICK_SIZE" not in caps:
         L.critical("MD does not support GET_TICKER_INFO_PRICE_TICK_SIZE cap")
         sys.exit(1)
+    g.cap_ob_incremental = "ORDER_BOOK_INCREMENTAL" in caps
     g.cap_sane_ob = "SANE_ORDER_BOOK" in caps
     g.cap_ob_levels = "ORDER_BOOK_LEVELS" in caps
     g.cap_pub_quotes = "PUB_QUOTES" in caps
     if not g.cap_sane_ob and g.cap_ob_levels:
         L.critical("illegal caps: ORDER_BOOK_LEVELS defined "
                    "without SANE_ORDER_BOOK")
+        sys.exit(1)
+    if g.cap_sane_ob and not g.cap_ob_incremental:
+        L.critical("illegal caps: SANE_ORDER_BOOK defined "
+                   "without ORDER_BOOK_INCREMENTAL")
         sys.exit(1)
     g.cap_ob_levels |= args.all_levels
     g.cap_pub_quotes |= args.no_quotes
