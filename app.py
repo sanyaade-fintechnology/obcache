@@ -811,18 +811,19 @@ async def init_check_capabilities(args):
     if "GET_TICKER_INFO_PRICE_TICK_SIZE" not in caps:
         L.critical("MD does not support GET_TICKER_INFO_PRICE_TICK_SIZE cap")
         sys.exit(1)
-    g.cap_ob_incremental = "ORDER_BOOK_INCREMENTAL" in caps
-    g.cap_sane_ob = "SANE_ORDER_BOOK" in caps
-    g.cap_ob_levels = "ORDER_BOOK_LEVELS" in caps
-    g.cap_pub_quotes = "PUB_QUOTES" in caps
-    if not g.cap_sane_ob and g.cap_ob_levels:
-        L.critical("illegal caps: ORDER_BOOK_LEVELS defined "
-                   "without SANE_ORDER_BOOK")
-        sys.exit(1)
-    if g.cap_sane_ob and not g.cap_ob_incremental:
-        L.critical("illegal caps: SANE_ORDER_BOOK defined "
-                   "without ORDER_BOOK_INCREMENTAL")
-        sys.exit(1)
+    g.cap_ob_incremental = "PUB_ORDER_BOOK_INCREMENTAL" in caps
+    g.cap_sane_ob = "PUB_SANE_ORDER_BOOK" in caps
+    g.cap_ob_levels = "PUB_ORDER_BOOK_LEVELS" in caps
+    g.cap_pub_quotes = "PUB_BBA_QUOTES" in caps
+    if g.cap_sane_ob:
+        if not g.cap_ob_incremental:
+            L.critical("illegal caps: PUB_SANE_ORDER_BOOK defined "
+                       "without PUB_ORDER_BOOK_INCREMENTAL")
+            sys.exit(1)
+        if not g.cap_ob_levels:
+            L.critical("illegal caps: PUB_ORDER_BOOK_LEVELS defined "
+                       "without PUB_SANE_ORDER_BOOK")
+            sys.exit(1)
     g.cap_ob_levels |= args.all_levels
     g.cap_pub_quotes |= args.no_quotes
     if g.cap_sane_ob and g.cap_ob_levels and g.cap_pub_quotes:
