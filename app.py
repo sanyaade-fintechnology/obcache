@@ -41,10 +41,6 @@ g.pub_bytes_in = 0
 g.pub_bytes_out = 0
 g.status = "ok"
 g.subscriptions = defaultdict(SubscriptionDefinition)
-# caps to be added to get_capabilities
-g.caps_to_add = []
-# caps to be removed from get_capabilities
-g.caps_to_del = []
 
 ################################### HELPERS ###################################
 
@@ -724,6 +720,24 @@ async def handle_modify_subscription(ident, msg, msg_raw):
         g.subscriptions[ticker_id] = old_sub_def
     await g.sock_ctl.send_multipart(ident + [b"", msg_bytes])
 
+async def handle_list_capabilities(ident, msg, msg_raw):
+    await g.sock_deal.send_multipart(ident + [b"", msg_raw])
+    msg_parts = await g.sock_deal_pub.poll_for_msg_id(msg["msg_id"])
+    msg = json.loads(msg_parts[-1].decode())
+    if msg["result"] != "ok":
+        await g.sock_ctl.send_multipart(ident + [b"", msg_parts[-1]])
+        return
+    caps = set(msg["content"])
+    if not g.args.all_levels:
+        caps.add("PUB_ORDER_BOOK_LEVELS")
+    if not g.args.no_quotes:
+        caps.add("PUB_BBA_QUOTES")
+    caps.add("PUB_ORDER_BOOK_INCREMENTAL")
+    caps.add("PUB_SANE_ORDER_BOOK")
+    msg["content"] = sorted(caps)
+    msg_bytes = (" " + json.dumps(msg)).encode()
+    await g.sock_ctl.send_multipart(ident + [b"", msg_bytes])
+
 async def handle_ctl_msg_1(ident, msg_raw):
     msg = json.loads(msg_raw.decode())
     msg_id = msg["msg_id"]
@@ -738,6 +752,8 @@ async def handle_ctl_msg_1(ident, msg_raw):
             await handle_get_status(ident, msg)
         elif cmd == "modify_subscription":
             await handle_modify_subscription(ident, msg, msg_raw)
+        elif cmd == "list_capabilities":
+            await handle_list_capabilities(ident, msg, msg_raw)
         else:
             await fwd_message_no_change(msg_id, ident + [b"", msg_raw])
     except Exception as e:
@@ -854,6 +870,7 @@ async def init_get_subscriptions():
 def main():
     global DEBUG
     args = parse_args()
+    g.args = args
     DEBUG = args.debug
     setup_logging(args)
     if DEBUG:
